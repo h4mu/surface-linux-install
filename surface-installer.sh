@@ -286,7 +286,7 @@ log_step "Installing packages (Base)..."
 apt-get install -y sudo systemd curl wget nano vim git network-manager openssh-client openssh-server initramfs-tools
 
 log_step "Installing packages (Desktop)..."
-apt-get install -y lxde lightdm
+apt-get install -y ubuntu-desktop-minimal gdm3
 
 log_step "Installing packages (Development)..."
 apt-get install -y build-essential gcc g++ clang cmake ninja-build pkg-config git-lfs
@@ -308,7 +308,19 @@ apt-get install -y steam nodejs google-chrome-stable
 
 log_step "Installing packages (Surface Support)..."
 # Ubuntu 24.04 (noble) compatible
-apt-get install -y linux-image-surface linux-headers-surface libwacom-surface iptsd linux-surface-secureboot-mok
+apt-get install -y linux-image-surface linux-headers-surface libwacom-surface iptsd linux-surface-secureboot-mok thermald
+
+# Surface optimizations
+log_step "Applying Surface optimizations..."
+# Screen flicker fix
+sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="i915.enable_psr=0 /' /etc/default/grub
+
+# Tablet mode: ignore lid switch
+mkdir -p /etc/systemd/logind.conf.d
+cat <<EOF > /etc/systemd/logind.conf.d/surface.conf
+[Login]
+HandleLidSwitch=ignore
+EOF
 
 # Bootloader
 log_step "Installing GRUB..."
