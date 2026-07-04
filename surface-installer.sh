@@ -312,6 +312,12 @@ apt-get install -y linux-image-surface linux-headers-surface libwacom-surface ip
 
 # Surface optimizations
 log_step "Applying Surface optimizations..."
+
+# Thermald configuration for Surface Pro 7
+mkdir -p /etc/thermald
+wget -O /etc/thermald/thermal-conf.xml https://raw.githubusercontent.com/linux-surface/linux-surface/refs/heads/master/contrib/thermald/surface_pro_7/thermal-conf.xml
+wget -O /etc/thermald/thermal-cpu-cdev-order.xml https://raw.githubusercontent.com/linux-surface/linux-surface/refs/heads/master/contrib/thermald/surface_pro_7/thermal-cpu-cdev-order.xml
+
 # Screen flicker fix
 sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="i915.enable_psr=0 /' /etc/default/grub
 
