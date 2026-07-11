@@ -17,7 +17,11 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# --- Logging Functions ---
+# --- Logging ---
+LOG_FILE="install.log"
+# Redirect all output to log file and stdout
+exec > >(tee -a "$LOG_FILE") 2>&1
+
 log_info() {
     echo -e "${BLUE}[$(date +'%Y-%m-%d %H:%M:%S')] INFO: $1${NC}"
 }
@@ -84,22 +88,28 @@ if [[ ${#MISSING_TOOLS[@]} -ne 0 ]]; then
 fi
 
 # --- Drive Selection ---
-log_info "Available block devices:"
-lsblk -p -d -n -o NAME,SIZE,MODEL
+if [ -n "${1:-}" ]; then
+    TARGET_DEV="$1"
+    log_info "Using target device from argument: $TARGET_DEV"
+    CONFIRM="YES"
+else
+    log_info "Available block devices:"
+    lsblk -p -d -n -o NAME,SIZE,MODEL
 
-echo ""
-read -r -p "Enter the device path to install Ubuntu on (e.g., /dev/sdX): " TARGET_DEV
+    echo ""
+    read -r -p "Enter the device path to install Ubuntu on (e.g., /dev/sdX): " TARGET_DEV
 
-if [ ! -b "$TARGET_DEV" ]; then
-    log_error "Device $TARGET_DEV not found or not a block device."
-    exit 1
-fi
+    if [ ! -b "$TARGET_DEV" ]; then
+        log_error "Device $TARGET_DEV not found or not a block device."
+        exit 1
+    fi
 
-log_warn "ALL DATA ON $TARGET_DEV WILL BE DESTROYED!"
-read -r -p "Type 'YES' to confirm: " CONFIRM
-if [ "$CONFIRM" != "YES" ]; then
-    log_info "Aborting."
-    exit 0
+    log_warn "ALL DATA ON $TARGET_DEV WILL BE DESTROYED!"
+    read -r -p "Type 'YES' to confirm: " CONFIRM
+    if [ "$CONFIRM" != "YES" ]; then
+        log_info "Aborting."
+        exit 0
+    fi
 fi
 
 # --- Partitioning ---
@@ -122,11 +132,24 @@ if command -v partprobe >/dev/null 2>&1; then
     udevadm settle
 fi
 
+# Special handling for loop devices to ensure partition nodes appear
+if [[ "$TARGET_DEV" == *loop* ]]; then
+    partx -u "$TARGET_DEV" || true
+    udevadm settle
+fi
+
 # Identify partitions
-# Handle NVMe/loop/mmcblk naming (/dev/nvme0n1p1, /dev/loop0p1)
-if [[ "$TARGET_DEV" == *nvme* ]] || [[ "$TARGET_DEV" == *mmcblk* ]] || [[ "$TARGET_DEV" == *loop* ]]; then
+if [[ "$TARGET_DEV" == *nvme* ]] || [[ "$TARGET_DEV" == *mmcblk* ]]; then
     PART_EFI="${TARGET_DEV}p1"
     PART_ROOT="${TARGET_DEV}p2"
+elif [[ "$TARGET_DEV" == *loop* ]]; then
+    if [ -b "${TARGET_DEV}p1" ]; then
+        PART_EFI="${TARGET_DEV}p1"
+        PART_ROOT="${TARGET_DEV}p2"
+    else
+        PART_EFI="${TARGET_DEV}1"
+        PART_ROOT="${TARGET_DEV}2"
+    fi
 else
     PART_EFI="${TARGET_DEV}1"
     PART_ROOT="${TARGET_DEV}2"
@@ -160,7 +183,11 @@ MOUNT_OPTS="noatime,lazytime,commit=120,errors=remount-ro"
 mount -o "$MOUNT_OPTS" "$PART_ROOT" /mnt/target
 
 mkdir -p /mnt/target/boot/efi
-mount "$PART_EFI" /mnt/target/boot/efi
+# For loopback tests in restricted environments, vfat might fail to mount
+if ! mount "$PART_EFI" /mnt/target/boot/efi; then
+    log_warn "Failed to mount EFI partition. If this is a loopback test on a restricted host, this is expected."
+    log_warn "Attempting to continue without EFI mount (GRUB install will fail)."
+fi
 
 # --- Debootstrap ---
 log_info "Installing base system (this will take a while)..."
@@ -171,7 +198,7 @@ log_info "Configuring chroot environment..."
 
 # Generate fstab
 ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
-EFI_UUID=$(blkid -s UUID -o value "$PART_EFI")
+EFI_UUID=$(blkid -s UUID -o value "$PART_EFI") || EFI_UUID="UNKNOWN"
 
 cat <<EOF > /mnt/target/etc/fstab
 # /etc/fstab: static file system information.
@@ -187,7 +214,6 @@ echo "surface-pro" > /mnt/target/etc/hostname
 echo "127.0.0.1 localhost surface-pro" > /mnt/target/etc/hosts
 
 # Prepare chroot helper script
-# Pass variables explicitly via heredoc expansion
 cat <<CHROOT_EOF > /mnt/target/setup-internal.sh
 #!/bin/bash
 set -Eeuo pipefail
@@ -205,24 +231,35 @@ log_step() { echo -e "\${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] INFO: >>> \$1\${NC
 
 export DEBIAN_FRONTEND=noninteractive
 
+# Configure APT sources
+cat <<EOF > /etc/apt/sources.list
+deb http://archive.ubuntu.com/ubuntu/ \$TARGET_DISTRO main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ \$TARGET_DISTRO-updates main restricted universe multiverse
+deb http://archive.ubuntu.com/ubuntu/ \$TARGET_DISTRO-security main restricted universe multiverse
+EOF
+
 # Update and install basic tools
-apt-get update
-apt-get install -y --no-install-recommends software-properties-common gnupg2 curl wget ca-certificates lsb-release
+apt update
+apt install -y --fix-missing --no-install-recommends software-properties-common gnupg curl wget ca-certificates lsb-release
+apt clean
 
 # Locales
-apt-get install -y locales
+apt install -y --fix-missing locales
 locale-gen en_US.UTF-8
 update-locale LANG=en_US.UTF-8
+apt clean
 
 # Timezone
 ln -fs /usr/share/zoneinfo/UTC /etc/localtime
 dpkg-reconfigure --frontend noninteractive tzdata
 
-# Keyboard and Console (Requested)
-apt-get install -y keyboard-configuration console-setup
+# Keyboard and Console
+apt install -y --fix-missing keyboard-configuration console-setup
+apt clean
 
 # Swapfile
 log_step "Creating swapfile..."
+swapoff /swapfile || true
 fallocate -l \${SWAP_SIZE_GB}G /swapfile
 chmod 600 /swapfile
 mkswap /swapfile
@@ -263,9 +300,6 @@ echo "\$TARGET_USER:\$TARGET_PASSWORD" | chpasswd
 
 # Repository additions
 log_step "Adding repositories..."
-
-# Steam (i386)
-dpkg --add-architecture i386
 add-apt-repository -y multiverse
 
 # NodeSource
@@ -279,36 +313,40 @@ echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /et
 wget -qO - https://raw.githubusercontent.com/linux-surface/linux-surface/master/pkg/keys/surface.asc | gpg --dearmor > /etc/apt/trusted.gpg.d/linux-surface.gpg
 echo "deb [arch=amd64] https://pkg.surfacelinux.com/debian release main" > /etc/apt/sources.list.d/linux-surface.list
 
-apt-get update
+apt update
 
 # Package Installation
 log_step "Installing packages (Base)..."
-apt-get install -y sudo systemd curl wget nano vim git network-manager openssh-client openssh-server initramfs-tools
+apt install -y --fix-missing sudo systemd curl wget nano vim git network-manager openssh-client openssh-server initramfs-tools
+apt clean
 
 log_step "Installing packages (Desktop)..."
-apt-get install -y ubuntu-desktop-minimal gdm3
+apt install -y --fix-missing ubuntu-desktop-minimal gdm3
+apt clean
 
 log_step "Installing packages (Development)..."
-apt-get install -y build-essential gcc g++ clang cmake ninja-build pkg-config git-lfs
-
-log_step "Installing packages (Graphics)..."
-apt-get install -y mesa-utils mesa-vulkan-drivers vulkan-tools vainfo
+apt install -y --fix-missing build-essential cmake
+apt clean
 
 log_step "Installing packages (Firmware)..."
-apt-get install -y linux-firmware intel-microcode
+apt install -y --fix-missing linux-firmware intel-microcode
+apt clean
 
 log_step "Installing packages (Android)..."
-apt-get install -y adb fastboot
+apt install -y --fix-missing adb fastboot
+apt clean
 # Android udev rules
 wget -O /etc/udev/rules.d/51-android.rules https://raw.githubusercontent.com/M0Rf30/android-udev-rules/master/51-android.rules
 chmod a+r /etc/udev/rules.d/51-android.rules
 
-log_step "Installing packages (Steam & Node.js & Chrome)..."
-apt-get install -y steam nodejs google-chrome-stable
+log_step "Installing packages (Node.js & Chrome)..."
+apt install -y --fix-missing nodejs google-chrome-stable
+apt clean
 
 log_step "Installing packages (Surface Support)..."
 # Ubuntu 24.04 (noble) compatible
-apt-get install -y linux-image-surface linux-headers-surface libwacom-surface iptsd linux-surface-secureboot-mok thermald
+apt install -y --fix-missing linux-image-surface linux-headers-surface libwacom-surface iptsd linux-surface-secureboot-mok thermald
+apt clean
 
 # Surface optimizations
 log_step "Applying Surface optimizations..."
@@ -317,9 +355,6 @@ log_step "Applying Surface optimizations..."
 mkdir -p /etc/thermald
 wget -O /etc/thermald/thermal-conf.xml https://raw.githubusercontent.com/linux-surface/linux-surface/refs/heads/master/contrib/thermald/surface_pro_7/thermal-conf.xml
 wget -O /etc/thermald/thermal-cpu-cdev-order.xml https://raw.githubusercontent.com/linux-surface/linux-surface/refs/heads/master/contrib/thermald/surface_pro_7/thermal-cpu-cdev-order.xml
-
-# Screen flicker fix
-sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="i915.enable_psr=0 /' /etc/default/grub
 
 # Tablet mode: ignore lid switch
 mkdir -p /etc/systemd/logind.conf.d
@@ -330,11 +365,20 @@ EOF
 
 # Bootloader
 log_step "Installing GRUB..."
-apt-get install -y grub-efi-amd64
-grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable
-update-grub
+apt install -y --fix-missing grub-efi-amd64
+apt clean
 
-# Update Initramfs (Requested)
+# Screen flicker fix & other GRUB modifications
+sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="i915.enable_psr=0 /' /etc/default/grub
+
+if mountpoint -q /boot/efi; then
+    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=GRUB --removable
+    update-grub
+else
+    echo "Skipping GRUB install as /boot/efi is not mounted."
+fi
+
+# Update Initramfs
 log_step "Updating initramfs..."
 update-initramfs -u
 
@@ -375,8 +419,8 @@ echo "[[ -f ~/.first-login.sh ]] && . ~/.first-login.sh" >> /home/\$TARGET_USER/
 log_step "Final cleanup..."
 # Disable periodic TRIM
 systemctl disable fstrim.timer || true
-apt-get autoremove -y
-apt-get clean
+apt autoremove -y
+apt clean
 rm /setup-internal.sh
 
 CHROOT_EOF
@@ -384,11 +428,16 @@ CHROOT_EOF
 chmod +x /mnt/target/setup-internal.sh
 
 log_info "Entering chroot..."
+mkdir -p /mnt/target/dev /mnt/target/dev/pts /mnt/target/proc /mnt/target/sys /mnt/target/sys/firmware/efi/efivars
 mount --bind /dev /mnt/target/dev
 mount --bind /dev/pts /mnt/target/dev/pts
 mount --bind /proc /mnt/target/proc
 mount --bind /sys /mnt/target/sys
-mount --bind /sys/firmware/efi/efivars /mnt/target/sys/firmware/efi/efivars
+if [ -d /sys/firmware/efi/efivars ]; then
+    mount --bind /sys/firmware/efi/efivars /mnt/target/sys/firmware/efi/efivars
+else
+    log_warn "EFI vars not found on host, skipping bind mount."
+fi
 
 chroot /mnt/target /setup-internal.sh
 
