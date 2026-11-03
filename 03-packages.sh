@@ -10,15 +10,21 @@ source "$SCRIPT_DIR/config.sh"
 # Redirect stdout and stderr to the log file while preserving console output
 exec > >(tee -a "$LOG_FILE") 2>&1
 
+CLEANUP_ON_ERROR=1
+
 error_handler() {
     local line_no=$1
     local last_command=$2
     local exit_code=$3
     log_error "Command '$last_command' failed at line $line_no with exit code $exit_code"
+    if [ "${CLEANUP_ON_ERROR:-0}" = "1" ]; then
+        cleanup_mounts
+    fi
     exit "$exit_code"
 }
 
 trap 'error_handler $LINENO "$BASH_COMMAND" $?' ERR
+trap 'log_error "Interrupted by signal."; cleanup_mounts; exit 130' INT TERM
 
 assert_root
 
@@ -91,6 +97,7 @@ TARGET_USER="$TARGET_USER"
 TARGET_PASSWORD="$TARGET_PASSWORD"
 ROOT_PASSWORD="$ROOT_PASSWORD"
 SWAP_SIZE_GB="$SWAP_SIZE_GB"
+GENERATED_CREDENTIALS="$GENERATED_CREDENTIALS"
 
 # Colors
 GREEN='\033[0;32m'
@@ -107,12 +114,12 @@ deb http://archive.ubuntu.com/ubuntu/ \${TARGET_DISTRO}-security main restricted
 EOF
 
 # Update and install basic tools
-apt-get update
-apt-get install -y --fix-missing --no-install-recommends software-properties-common gnupg curl wget ca-certificates lsb-release
+apt-get update -o Acquire::Retries=3
+apt-get install -y --no-install-recommends software-properties-common gnupg curl wget ca-certificates lsb-release
 apt-get clean
 
 # Locales
-apt-get install -y --fix-missing locales
+apt-get install -y locales
 locale-gen en_US.UTF-8
 update-locale LANG=en_US.UTF-8
 apt-get clean
@@ -122,7 +129,7 @@ ln -fs /usr/share/zoneinfo/UTC /etc/localtime
 dpkg-reconfigure --frontend noninteractive tzdata
 
 # Keyboard and Console
-apt-get install -y --fix-missing keyboard-configuration console-setup
+apt-get install -y keyboard-configuration console-setup
 apt-get clean
 
 # Swapfile (idempotent: if /swapfile size is correct, skip)
@@ -175,55 +182,59 @@ echo "root:\$ROOT_PASSWORD" | chpasswd
 if ! id -u "\$TARGET_USER" >/dev/null 2>&1; then
     useradd -m -s /bin/bash -G sudo,plugdev,audio,video,render,input,dialout "\$TARGET_USER"
     echo "\$TARGET_USER:\$TARGET_PASSWORD" | chpasswd
+    if [ "\$GENERATED_CREDENTIALS" = "1" ]; then
+        chage -d 0 "\$TARGET_USER"
+    fi
 else
     log_step "User \$TARGET_USER already exists."
 fi
 
 # Repository additions
 log_step "Adding repositories..."
-add-apt-repository -y multiverse
+mkdir -p /etc/apt/keyrings
 
-# NodeSource
+# NodeSource (manual repository setup instead of piping a remote script to bash)
 if [ ! -f /etc/apt/sources.list.d/nodesource.list ]; then
     log_step "Adding NodeSource repository..."
-    curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
 fi
 
 # Google Chrome
 if [ ! -f /etc/apt/sources.list.d/google-chrome.list ]; then
     log_step "Adding Google Chrome repository..."
-    wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor > /etc/apt/trusted.gpg.d/google-chrome.gpg
-    echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
+    wget -qO - https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
 fi
 
 # Linux Surface
 if [ ! -f /etc/apt/sources.list.d/linux-surface.list ]; then
     log_step "Adding Linux Surface repository..."
-    wget -qO - https://raw.githubusercontent.com/linux-surface/linux-surface/master/pkg/keys/surface.asc | gpg --dearmor > /etc/apt/trusted.gpg.d/linux-surface.gpg
-    echo "deb [arch=amd64] https://pkg.surfacelinux.com/debian release main" > /etc/apt/sources.list.d/linux-surface.list
+    wget -qO - https://raw.githubusercontent.com/linux-surface/linux-surface/master/pkg/keys/surface.asc | gpg --dearmor -o /etc/apt/keyrings/linux-surface.gpg
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/linux-surface.gpg] https://pkg.surfacelinux.com/debian release main" > /etc/apt/sources.list.d/linux-surface.list
 fi
 
-apt-get update
+apt-get update -o Acquire::Retries=3
 
 # Package Installation
 log_step "Installing packages (Base)..."
-apt-get install -y --fix-missing sudo systemd curl wget nano vim git network-manager openssh-client openssh-server initramfs-tools
+apt-get install -y sudo systemd curl wget nano vim git network-manager openssh-client openssh-server initramfs-tools
 apt-get clean
 
 log_step "Installing packages (Desktop)..."
-apt-get install -y --fix-missing ubuntu-desktop-minimal gdm3
+apt-get install -y ubuntu-desktop-minimal gdm3
 apt-get clean
 
 log_step "Installing packages (Development)..."
-apt-get install -y --fix-missing build-essential cmake
+apt-get install -y build-essential cmake
 apt-get clean
 
 log_step "Installing packages (Firmware)..."
-apt-get install -y --fix-missing linux-firmware intel-microcode
+apt-get install -y linux-firmware intel-microcode
 apt-get clean
 
 log_step "Installing packages (Android)..."
-apt-get install -y --fix-missing adb fastboot
+apt-get install -y adb fastboot
 apt-get clean
 # Android udev rules
 if [ ! -f /etc/udev/rules.d/51-android.rules ]; then
@@ -232,11 +243,11 @@ if [ ! -f /etc/udev/rules.d/51-android.rules ]; then
 fi
 
 log_step "Installing packages (Node.js & Chrome)..."
-apt-get install -y --fix-missing nodejs google-chrome-stable
+apt-get install -y nodejs google-chrome-stable
 apt-get clean
 
 log_step "Installing packages (Surface Support)..."
-apt-get install -y --fix-missing linux-image-surface linux-headers-surface libwacom-surface iptsd linux-surface-secureboot-mok thermald
+apt-get install -y linux-image-surface linux-headers-surface libwacom-surface iptsd linux-surface-secureboot-mok thermald
 apt-get clean
 
 # Surface optimizations
@@ -260,12 +271,12 @@ EOF
 
 # Finished packages installation inside chroot
 log_step "Chroot packages script finished."
-rm /setup-packages.sh
 CHROOT_EOF
 
     chmod +x /mnt/target/setup-packages.sh
 
     log_info "Entering chroot to install packages..."
     chroot /mnt/target /setup-packages.sh
+    rm -f /mnt/target/setup-packages.sh
     log_success "Packages installation phase complete."
 fi

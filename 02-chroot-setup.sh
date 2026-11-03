@@ -10,15 +10,21 @@ source "$SCRIPT_DIR/config.sh"
 # Redirect stdout and stderr to the log file while preserving console output
 exec > >(tee -a "$LOG_FILE") 2>&1
 
+CLEANUP_ON_ERROR=1
+
 error_handler() {
     local line_no=$1
     local last_command=$2
     local exit_code=$3
     log_error "Command '$last_command' failed at line $line_no with exit code $exit_code"
+    if [ "${CLEANUP_ON_ERROR:-0}" = "1" ]; then
+        cleanup_mounts
+    fi
     exit "$exit_code"
 }
 
 trap 'error_handler $LINENO "$BASH_COMMAND" $?' ERR
+trap 'log_error "Interrupted by signal."; cleanup_mounts; exit 130' INT TERM
 
 assert_root
 
@@ -55,8 +61,14 @@ mkdir -p /mnt/target/boot/efi
 if ! mountpoint -q /mnt/target/boot/efi; then
     log_info "Mounting EFI partition $PART_EFI to /mnt/target/boot/efi..."
     if ! mount "$PART_EFI" /mnt/target/boot/efi; then
-        log_warn "Failed to mount EFI partition. If this is a loopback test on a restricted host, this is expected."
-        log_warn "Attempting to continue without EFI mount (GRUB install may fail)."
+        if [ "${ALLOW_MISSING_EFI:-0}" = "1" ]; then
+            log_warn "Failed to mount EFI partition; continuing because ALLOW_MISSING_EFI=1."
+            log_warn "GRUB installation will be skipped and the resulting system may not boot."
+        else
+            log_error "Failed to mount EFI partition $PART_EFI. Refusing to build an unbootable system."
+            log_info "For loopback testing where EFI mounting is unavailable, set ALLOW_MISSING_EFI=1."
+            exit 1
+        fi
     fi
 else
     log_info "EFI partition already mounted at /mnt/target/boot/efi."
@@ -79,9 +91,14 @@ fi
 # --- Chroot Configuration ---
 log_info "Configuring fstab, hostname and hosts..."
 
-# Generate fstab if it does not exist
-ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT")
-EFI_UUID=$(blkid -s UUID -o value "$PART_EFI") || EFI_UUID="UNKNOWN"
+# Generate fstab only with valid filesystem UUIDs
+ROOT_UUID=$(blkid -s UUID -o value "$PART_ROOT" || true)
+EFI_UUID=$(blkid -s UUID -o value "$PART_EFI" || true)
+
+if [ -z "$ROOT_UUID" ] || [ -z "$EFI_UUID" ]; then
+    log_error "Could not determine filesystem UUIDs (root='$ROOT_UUID', efi='$EFI_UUID')."
+    exit 1
+fi
 
 cat <<EOF > /mnt/target/etc/fstab
 # /etc/fstab: static file system information.
@@ -89,7 +106,7 @@ UUID=$ROOT_UUID /               ext4    $MOUNT_OPTS 0       1
 UUID=$EFI_UUID  /boot/efi       vfat    umask=0077      0       2
 tmpfs           /tmp            tmpfs   defaults,noatime,mode=1777 0       0
 tmpfs           /var/tmp        tmpfs   defaults,noatime,mode=1777 0       0
-/swapfile       none            swap    sw              0       0
+/swapfile       none            swap    sw,nofail       0       0
 EOF
 
 # Set hostname
@@ -100,11 +117,7 @@ echo "127.0.0.1 localhost surface-pro" > /mnt/target/etc/hosts
 log_info "Setting up bind mounts..."
 
 # Create basic dirs under target root before bind mounts are mounted
-mkdir -p /mnt/target/dev /mnt/target/dev/pts /mnt/target/proc /mnt/target/sys
-
-if ! mountpoint -q /mnt/target/sys; then
-    mkdir -p /mnt/target/sys/firmware/efi/efivars || true
-fi
+mkdir -p /mnt/target/dev /mnt/target/dev/pts /mnt/target/proc /mnt/target/sys /mnt/target/run
 
 bind_mount() {
     local src="$1"
@@ -123,8 +136,10 @@ bind_mount /dev /mnt/target/dev
 bind_mount /dev/pts /mnt/target/dev/pts
 bind_mount /proc /mnt/target/proc
 bind_mount /sys /mnt/target/sys
+bind_mount /run /mnt/target/run
 
 if [ -d /sys/firmware/efi/efivars ]; then
+    mkdir -p /mnt/target/sys/firmware/efi/efivars
     bind_mount /sys/firmware/efi/efivars /mnt/target/sys/firmware/efi/efivars
 else
     log_warn "EFI vars not found on host, skipping bind mount."

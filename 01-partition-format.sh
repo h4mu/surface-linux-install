@@ -24,42 +24,23 @@ assert_root
 check_host_tools
 
 # --- Drive Selection ---
-if [ -n "${1:-}" ]; then
-    TARGET_DEV="$1"
-    log_info "Using target device from argument: $TARGET_DEV"
-    CONFIRM="YES"
-else
-    log_info "Available block devices:"
-    lsblk -p -d -n -o NAME,SIZE,MODEL
-
-    echo ""
-    read -r -p "Enter the device path to install Ubuntu on (e.g., /dev/sdX): " TARGET_DEV
-
-    if [ ! -b "$TARGET_DEV" ]; then
-        log_error "Device $TARGET_DEV not found or not a block device."
-        exit 1
-    fi
-
-    log_warn "ALL DATA ON $TARGET_DEV WILL BE DESTROYED!"
-    read -r -p "Type 'YES' to confirm: " CONFIRM
-    if [ "$CONFIRM" != "YES" ]; then
-        log_info "Aborting."
-        exit 0
-    fi
-fi
+# When invoked by the main installer the device and confirmation are already
+# provided; when run standalone this performs the full interactive flow.
+select_target_device "${1:-}"
+log_info "Using target device: $TARGET_DEV"
 
 # Resolve partitions paths
 resolve_partitions "$TARGET_DEV"
 
-# Idempotency check:
+# Idempotency check: only reuse an existing layout when explicitly requested.
 IS_FORMATTED=false
 if blkid -t LABEL="EFI" -o device | grep -q "^${PART_EFI}$" && blkid -t LABEL="ROOT" -o device | grep -q "^${PART_ROOT}$"; then
     IS_FORMATTED=true
 fi
 
-if [ "$IS_FORMATTED" = true ] && [ -n "${1:-}" ]; then
+if [ "$IS_FORMATTED" = true ] && [ "$REUSE_EXISTING" = "1" ]; then
     log_info "Target device $TARGET_DEV is already partitioned and formatted with 'EFI' and 'ROOT' partitions."
-    log_info "Skipping partitioning and formatting to maintain idempotency."
+    log_info "Reusing the existing layout because --reuse was supplied."
 else
     log_info "Wiping existing signatures on $TARGET_DEV..."
     # If the partitions are mounted, unmount them before wiping
