@@ -111,7 +111,10 @@ EOF
 
 # Set hostname
 echo "surface-pro" > /mnt/target/etc/hostname
-echo "127.0.0.1 localhost surface-pro" > /mnt/target/etc/hosts
+cat > /mnt/target/etc/hosts <<EOF
+127.0.0.1 localhost surface-pro
+::1       localhost ip6-localhost ip6-loopback
+EOF
 
 # Mount bind mounts for chroot
 log_info "Setting up bind mounts..."

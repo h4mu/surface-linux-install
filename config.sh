@@ -46,6 +46,8 @@ NC='\033[0m' # No Color
 # --- Logging Setup ---
 LOG_FILE="${LOG_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/install.log}"
 export LOG_FILE
+( umask 077; touch "$LOG_FILE" ) 2>/dev/null || true
+chmod 600 "$LOG_FILE" 2>/dev/null || true
 
 log_info() {
     echo -e "${BLUE}[$(date +'%Y-%m-%d %H:%M:%S')] INFO: $1${NC}"
@@ -62,6 +64,24 @@ log_error() {
 log_success() {
     echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')] SUCCESS: $1${NC}"
 }
+
+# --- Input Validation ---
+if ! [[ "$TARGET_USER" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+    log_error "Invalid TARGET_USER '$TARGET_USER'. Use lowercase letters, digits, '_' or '-'."
+    exit 1
+fi
+
+if ! [[ "$NODE_MAJOR" =~ ^[0-9]+$ ]]; then
+    log_error "Invalid NODE_MAJOR '$NODE_MAJOR'. Expected a numeric major version."
+    exit 1
+fi
+
+case "$TARGET_PASSWORD$ROOT_PASSWORD" in
+    *$'\n'*|*$'\r'*)
+        log_error "Passwords must not contain newline characters."
+        exit 1
+        ;;
+esac
 
 # --- Common Helper Functions ---
 resolve_partitions() {
@@ -222,6 +242,9 @@ select_target_device() {
 }
 
 cleanup_mounts() {
+    if mountpoint -q /mnt/target 2>/dev/null; then
+        rm -f /mnt/target/setup-packages.sh /mnt/target/setup-boot.sh 2>/dev/null || true
+    fi
     sync || true
     local mnt
     for mnt in \
