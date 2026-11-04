@@ -87,6 +87,24 @@ EOF
 
     log_success "Packages simulation phase complete."
 else
+    # Configure swapfile on the host. Doing this inside the chroot is unreliable:
+    # the chroot shares the host's /proc, so if the host already has an active
+    # /swapfile, mkswap refuses the target's /swapfile ("is mounted") and
+    # swapoff cannot find the host's swap area from inside the chroot.
+    log_info "Configuring swapfile..."
+    SWAP_SIZE_BYTES=$((SWAP_SIZE_GB * 1024 * 1024 * 1024))
+    CURRENT_SWAP_SIZE=$(stat -c %s /mnt/target/swapfile 2>/dev/null || echo 0)
+
+    if [ "$CURRENT_SWAP_SIZE" -ne "$SWAP_SIZE_BYTES" ]; then
+        log_info "Creating swapfile of size ${SWAP_SIZE_GB}GB..."
+        rm -f /mnt/target/swapfile
+        fallocate -l ${SWAP_SIZE_GB}G /mnt/target/swapfile
+        chmod 600 /mnt/target/swapfile
+        mkswap /mnt/target/swapfile
+    else
+        log_info "Swapfile of correct size already exists. Skipping."
+    fi
+
     # Prepare chroot helper script
     cat <<CHROOT_EOF > /mnt/target/setup-packages.sh
 #!/bin/bash
@@ -132,20 +150,8 @@ dpkg-reconfigure --frontend noninteractive tzdata
 apt-get install -y keyboard-configuration console-setup
 apt-get clean
 
-# Swapfile (idempotent: if /swapfile size is correct, skip)
-log_step "Configuring swapfile..."
-SWAP_SIZE_BYTES=\$((SWAP_SIZE_GB * 1024 * 1024 * 1024))
-CURRENT_SWAP_SIZE=\$(stat -c %s /swapfile 2>/dev/null || echo 0)
-
-if [ "\$CURRENT_SWAP_SIZE" -ne "\$SWAP_SIZE_BYTES" ]; then
-    log_step "Creating swapfile of size \${SWAP_SIZE_GB}GB..."
-    swapoff /swapfile || true
-    fallocate -l \${SWAP_SIZE_GB}G /swapfile
-    chmod 600 /swapfile
-    mkswap /swapfile
-else
-    log_step "Swapfile of correct size already exists. Skipping."
-fi
+# Swapfile was created on the host before entering the chroot
+log_step "Swapfile configured."
 
 # Sysctl optimizations
 log_step "Configuring sysctl..."
